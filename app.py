@@ -24,8 +24,10 @@ client = genai.Client(api_key=api_key)
 model_id = "gemini-2.0-flash-exp"
 
 # CLIPモデルの準備
-device = "cuda" if torch.cuda.is_available() else "cpu"
-clip_model, preprocess = clip.load("ViT-B/32", device=device)
+def load_clip_model():
+    device = "cpu"  # Cloud上では常にCPU
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    return model, preprocess
 
 # ======== 関数定義 ========
 
@@ -104,6 +106,7 @@ if image_paths:
 uploaded_file = st.file_uploader("空の写真をアップロードしてください（JPEG/PNG/HEIC）", type=["jpg", "jpeg", "png", "heic"])
 
 if uploaded_file:
+    clip_model, preprocess = load_clip_model()
     st.image(uploaded_file, caption="アップロードされた画像", use_container_width=True)
     image_bytes = uploaded_file.read()
 
