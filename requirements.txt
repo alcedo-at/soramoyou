@@ -1,7 +1,6 @@
 streamlit
-google-genai
-python-dotenv
-Pillow
 sentence-transformers
-scikit-learn
+pillow-heif
 numpy
+Pillow
+scikit-learn
