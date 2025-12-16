@@ -836,7 +836,7 @@ def overlay_cache_key(image_sha: str, words: Sequence[str]) -> str:
 # ============================================================
 # UI
 # ============================================================
-st.title("🌤️ そらもよう：空を共有して似た空を探す")
+st.title("🌤️ そらもよう～空をことばで感じるAIシステムの開発～")
 
 # session_state init
 st.session_state.setdefault("gemini_cache", {})  # sha256(image_bytes) -> {"words": [...], "raw": "..."}
