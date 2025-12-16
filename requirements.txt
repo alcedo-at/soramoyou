@@ -1,3 +1,8 @@
+git+https://github.com/openai/CLIP.git
+ftfy
+regex
+tqdm
+torch>=2.1
 streamlit>=1.36
 requests>=2.31
 numpy>=1.26
