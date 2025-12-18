@@ -21,6 +21,7 @@ import pillow_heif
 from google import genai
 from google.genai.types import Part
 from sklearn.metrics.pairwise import cosine_similarity
+import threading
 
 # ============================================================
 # そらもよう：空を共有して似た空を探す
@@ -64,6 +65,7 @@ if not GITHUB_TOKEN or not GITHUB_REPO:
     st.stop()
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+CLIP_INFER_LOCK = threading.Lock()
 
 # ------------------------------
 # Model (CLIP)
@@ -115,8 +117,10 @@ def get_image_feature(image_path_or_file):
     image = image.convert("RGB").resize((512, 512))
     image_input = PREPROCESS(image).unsqueeze(0).to(DEVICE)
 
-    with torch.no_grad():
-        feature = CLIP_MODEL.encode_image(image_input)
+    with CLIP_INFER_LOCK:
+        with torch.no_grad():
+            feature = CLIP_MODEL.encode_image(image_input)
+
     feature = feature / feature.norm(dim=-1, keepdim=True)
     return feature.cpu().numpy()[0]
 
@@ -124,8 +128,10 @@ def get_image_feature(image_path_or_file):
 def get_text_feature(word: str) -> np.ndarray:
     """CLIPのtext encoderで単語埋め込みを作り、正規化して返す"""
     text = clip.tokenize([word]).to(DEVICE)
-    with torch.no_grad():
-        feat = CLIP_MODEL.encode_text(text)
+    with CLIP_INFER_LOCK:
+        with torch.no_grad():
+            feat = CLIP_MODEL.encode_text(text)
+
     feat = feat / feat.norm(dim=-1, keepdim=True)
     return feat.cpu().numpy()[0]
 
@@ -506,7 +512,7 @@ def gemini_generate_words(image_bytes: bytes) -> Tuple[List[str], str]:
         return [], "GEMINI_API_KEY が設定されていません。"
 
     prompt = (
-        "この空の写真を見て、日本語で『空を表す言葉』と『擬態語』をそれぞれ箇条書きで提案してください。"
+        "この空の写真を見て、日本語で『空を表すかっこいい日本語』と『擬態語』をそれぞれ箇条書きで提案してください。"
         "この空の写真を見て、日本語で、空を表す言葉、擬態語、を提案します、などの前置きは不要です。"
         "『空を表す言葉』と『擬態語』以外の単語は出力しないでください。"
         "「空を表す言葉」、という言葉は出力に含めないでください。"
