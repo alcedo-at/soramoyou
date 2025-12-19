@@ -13,7 +13,7 @@ import numpy as np
 import requests
 import streamlit as st
 import torch
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageStat, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageStat, UnidentifiedImageError, ImageOps
 from sentence_transformers import util
 
 import clip
@@ -22,6 +22,7 @@ from google import genai
 from google.genai.types import Part
 from sklearn.metrics.pairwise import cosine_similarity
 import threading
+import json
 
 # ============================================================
 # そらもよう：空を共有して似た空を探す
@@ -88,12 +89,16 @@ def sha256_hex(data: bytes) -> str:
 
 
 def load_image_from_bytes(image_bytes: bytes) -> Image.Image:
-    """JPEG/PNG を優先し、失敗したら HEIC として読む。"""
+    """画像bytesからPIL画像を生成します（EXIF回転を補正し、HEICも対応）。"""
     try:
-        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img = Image.open(io.BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img)  # 縦写真が横になる問題を抑止
+        return img.convert("RGB")
     except UnidentifiedImageError:
         heif = pillow_heif.read_heif(io.BytesIO(image_bytes))
         img = Image.frombytes(heif.mode, heif.size, heif.data, "raw")
+        # HEICはEXIF回転が別管理の場合があるため、念のため適用
+        img = ImageOps.exif_transpose(img)
         return img.convert("RGB")
 
 
@@ -106,13 +111,13 @@ def get_image_feature(image_path_or_file):
     - file-like: Streamlit UploadedFile 等
     """
     if isinstance(image_path_or_file, str):
-        image = Image.open(image_path_or_file)
+        image = ImageOps.exif_transpose(Image.open(image_path_or_file))
     elif isinstance(image_path_or_file, bytes):
-        image = Image.open(io.BytesIO(image_path_or_file))
+        image = ImageOps.exif_transpose(Image.open(io.BytesIO(image_path_or_file)))
     elif isinstance(image_path_or_file, Image.Image):
         image = image_path_or_file
     else:
-        image = Image.open(image_path_or_file)
+        image = ImageOps.exif_transpose(Image.open(image_path_or_file))
 
     image = image.convert("RGB").resize((512, 512))
     image_input = PREPROCESS(image).unsqueeze(0).to(DEVICE)
@@ -503,21 +508,51 @@ def extract_words_from_text(result_text: str, max_words: int = 10) -> List[str]:
     return uniq[:max_words]
 
 
-def gemini_generate_words(image_bytes: bytes) -> Tuple[List[str], str]:
+def _strip_code_fences(s: str) -> str:
+    """Geminiが ```json ... ``` で返した場合に備えてフェンスを除去します。"""
+    if not s:
+        return s
+    s2 = s.strip()
+    if s2.startswith("```"):
+        # 先頭行の ```json / ``` を除去
+        s2 = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s2)
+        # 末尾の ``` を除去
+        s2 = re.sub(r"\s*```\s*$", "", s2)
+    return s2.strip()
+
+
+def gemini_generate_words(image_bytes: bytes) -> Tuple[List[str], Dict[str, str], str]:
     """
-    Geminiで単語を生成し、抽出した単語リストと raw_text を返す。
-    失敗した場合は ([], error_message)。
+    Geminiで単語を生成し、
+      - words: CLIP評価に使う「単語だけ」のリスト
+      - defs : {単語: 辞書的な定義}（表示用）
+      - raw_text: Geminiの生出力
+    を返します。
+
+    失敗した場合は ([], {}, error_message)。
     """
     if gemini_client is None:
-        return [], "GEMINI_API_KEY が設定されていません。"
+        return [], {}, "GEMINI_API_KEY が設定されていません。"
 
+    # 重要: CLIP一致度に解説文を混ぜないため、Geminiの出力を JSON のみに固定します。
+    # 「辞書的な定義」は defs として保持し、表示だけに使います。
     prompt = (
-        "この空の写真を見て、日本語で『空を表すかっこいい日本語』と『擬態語』をそれぞれ箇条書きで提案してください。"
-        "この空の写真を見て、日本語で、空を表す言葉、擬態語、を提案します、などの前置きは不要です。"
-        "『空を表す言葉』と『擬態語』以外の単語は出力しないでください。"
-        "「空を表す言葉」、という言葉は出力に含めないでください。"
-        "同じ単語をひらがな,漢字、カタカナで重複させないでください。"
-        "各カテゴリは最大4個、合計は最大8個にしてください。"
+        "次の条件を厳守して、JSON だけを出力してください。前置き、注釈、箇条書き、見出し、コードブロックは一切不要です。"
+        "\n\n"
+        "【出力形式】\n"
+        "{\n"
+        '  "sky_words": [\n'
+        '    {"word": "単語", "definition": "辞書的な定義（短く）"}, ...\n'
+        "  ],\n"
+        '  "onomatopoeia": [\n'
+        '    {"word": "擬態語", "definition": "意味（短く）"}, ...\n'
+        "  ]\n"
+        "}\n\n"
+        "【内容条件】\n"
+        "- sky_words は空を表す日本語（最大4個）\n"
+        "- onomatopoeia は擬態語（最大4個）\n"
+        "- 同じ語をひらがな・漢字・カタカナで重複させない\n"
+        "- definition は短く、辞書的に（1文程度）\n"
     )
 
     try:
@@ -526,16 +561,38 @@ def gemini_generate_words(image_bytes: bytes) -> Tuple[List[str], str]:
             model=GEMINI_MODEL_ID,
             contents=[prompt, part],
         )
-        text = ""
-        if hasattr(resp, "text") and resp.text:
-            text = resp.text
-        else:
-            # 念のため
-            text = str(resp)
-        words = extract_words_from_text(text, max_words=10)
-        return words, text
+
+        raw_text = resp.text if hasattr(resp, "text") and resp.text else str(resp)
+        cleaned = _strip_code_fences(raw_text)
+
+        words: List[str] = []
+        defs: Dict[str, str] = {}
+
+        try:
+            data = json.loads(cleaned)
+            for key in ("sky_words", "onomatopoeia"):
+                arr = data.get(key, [])
+                if not isinstance(arr, list):
+                    continue
+                for it in arr:
+                    if not isinstance(it, dict):
+                        continue
+                    w = str(it.get("word", "")).strip()
+                    d = str(it.get("definition", "")).strip()
+                    if not w:
+                        continue
+                    if w not in defs:
+                        words.append(w)
+                        defs[w] = d
+        except Exception:
+            # JSONが崩れて返る場合に備え、従来の抽出ロジックにフォールバック（定義は空）
+            words = extract_words_from_text(raw_text, max_words=10)
+            defs = {w: "" for w in words}
+
+        return words, defs, raw_text
+
     except Exception as e:
-        return [], f"Gemini呼び出しに失敗しました: {e}"
+        return [], {}, f"Gemini呼び出しに失敗しました: {e}"
 
 
 # ============================================================
@@ -650,8 +707,8 @@ def overlay_words_variable_size(
     *,
     font_path: str = "fonts/NotoSansJP-Bold.ttf",
     padding_ratio: float = 0.05,
-    min_font: int = 18,
-    max_font: int = 60,
+    min_font: int = 0,
+    max_font: int = 0,
     size_gamma: float = 2.2,
     size_contrast: float = 2.0,
     scatter_strength: float = 0.0,
@@ -659,9 +716,12 @@ def overlay_words_variable_size(
 ) -> Image.Image:
     """
     word_scores: [(word, score01), ...]
-    - scoreに応じてフォントサイズを変える
-    - 縦積みブロックが余白内に収まるまで全体を縮小
-    - 空いている領域中心に配置
+
+    - score に応じてフォントサイズを変える
+    - フォントサイズは、原則として画像サイズ（短辺）に比例して決める
+      - min_font / max_font が 1 以上なら、その値を優先（固定サイズを使いたい場合）
+      - 0 以下なら、画像サイズから自動決定
+    - 配置は scatter_strength に応じて「縦積み」または「散布」
     """
     img = load_image_from_bytes(image_bytes)
     draw = ImageDraw.Draw(img)
@@ -673,17 +733,31 @@ def overlay_words_variable_size(
         )
 
     W, H = img.size
+    short_side = min(W, H)
+
+    # ------------------------------
+    # 画像サイズに応じたフォントサイズ（核心）
+    # ------------------------------
+    # UIから固定値を渡す場合に備え、1以上は固定値として採用。
+    # 0以下は画像サイズから推定。
+    if int(min_font) > 0:
+        eff_min_font = int(min_font)
+    else:
+        eff_min_font = max(14, int(round(short_side * 0.035)))  # 3.5%
+
+    if int(max_font) > 0:
+        eff_max_font = int(max_font)
+    else:
+        eff_max_font = max(eff_min_font + 2, int(round(short_side * 0.070)))  # 7.0%
+
     pad = max(8, int(W * float(padding_ratio)))
     max_w = W - 2 * pad
     max_h = H - 2 * pad
 
     fill = choose_text_color(img)
-
     cx, cy = find_smooth_region(img, window=min(160, max(80, W // 6)))
 
-
-    # スコアが近いとフォントサイズ差が出にくいので、単語集合内で相対正規化してコントラストを付与します。
-    # - mx==mn の場合はそのまま
+    # スコアが近いとフォントサイズ差が出にくいので、単語集合内で相対正規化してコントラストを付与
     scores = [float(s) for _, s in word_scores] if word_scores else []
     mn = min(scores) if scores else 0.0
     mx = max(scores) if scores else 1.0
@@ -701,7 +775,12 @@ def overlay_words_variable_size(
     items: List[List] = []
     for word, s01 in word_scores:
         s_adj = _adjust_score(float(s01))
-        fs = font_size_from_score(s_adj, min_size=min_font, max_size=max_font, gamma=size_gamma)
+        fs = font_size_from_score(
+            s_adj,
+            min_size=eff_min_font,
+            max_size=eff_max_font,
+            gamma=size_gamma,
+        )
         font = ImageFont.truetype(font_path, fs)
         bbox = draw.textbbox((0, 0), word, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -709,7 +788,7 @@ def overlay_words_variable_size(
 
     gap = 10
 
-    # まず、各単語が余白内に収まる程度までフォントを調整
+    # まず、各単語が余白内に収まる程度までフォントを調整（保険）
     for _ in range(12):
         if not items:
             break
@@ -724,13 +803,11 @@ def overlay_words_variable_size(
         if not too_big:
             break
 
-    # ============================================================
-    # 配置戦略
-    # scatter_strength <= 0: 従来どおり「1ブロック縦積み」
-    # scatter_strength > 0 : 文字を散らして配置（重なり回避）
-    # ============================================================
     scatter = float(np.clip(scatter_strength, 0.0, 1.0))
 
+    # ------------------------------
+    # 縦積み（従来）
+    # ------------------------------
     if scatter <= 0.0:
         block_w = max(it[4] for it in items) if items else 0
         block_h = sum(it[5] for it in items) + gap * (len(items) - 1 if len(items) >= 2 else 0)
@@ -749,22 +826,20 @@ def overlay_words_variable_size(
 
         return img
 
-    # --- 散布配置 ---
-    # 決定的にしたいので seed を与える（キャッシュキーと整合）
+    # ------------------------------
+    # 散布配置（重なり回避）
+    # ------------------------------
     if seed is None:
         seed = int(hashlib.sha256(str(word_scores).encode("utf-8")).hexdigest()[:8], 16)
     rng = random.Random(seed)
 
-    # 「滑らかな領域」候補を複数取得（上位ほど描きやすい）
     centers = find_smooth_regions(
         img,
         window=min(200, max(90, W // 5)),
         top_k=min(30, max(8, len(items) * 3)),
     )
 
-    # 文字の散らし半径（画像サイズに対する割合）
-    radius = int(min(W, H) * (0.08 + 0.28 * scatter))
-
+    radius = int(short_side * (0.08 + 0.28 * scatter))
     placed: List[Tuple[int, int, int, int]] = []  # x1,y1,x2,y2
 
     def intersects(r1, r2) -> bool:
@@ -777,7 +852,6 @@ def overlay_words_variable_size(
         word, s01, fs, font, tw, th = it
         ok = False
 
-        # 候補点を巡回しつつ、ランダムオフセットで試行
         tries = min(80, 20 + len(centers) * 4)
         for t in range(tries):
             base = centers[(idx_it + t) % len(centers)]
@@ -798,7 +872,6 @@ def overlay_words_variable_size(
 
             rect = (x - 4, y - 4, x + tw + 4, y + th + 4)
 
-            # 重なり回避
             if any(intersects(rect, r2) for r2 in placed):
                 continue
 
@@ -807,28 +880,14 @@ def overlay_words_variable_size(
             ok = True
             break
 
-        # どうしても置けない場合は、中央付近にフォールバック（重なり許容）
         if not ok:
+            # どうしても置けない場合はフォールバック（重なり許容）
             x = int(cx - tw / 2)
             y = int(cy - th / 2)
             x = max(pad, min(x, W - pad - tw))
             y = max(pad, min(y, H - pad - th))
             draw.text((x, y), word, font=font, fill=fill)
             placed.append((x - 4, y - 4, x + tw + 4, y + th + 4))
-
-    return img
-
-    x0 = int(cx - block_w / 2)
-    y0 = int(cy - block_h / 2)
-
-    x0 = max(pad, min(x0, W - pad - block_w))
-    y0 = max(pad, min(y0, H - pad - block_h))
-
-    y = y0
-    for word, s01, fs, font, tw, th in items:
-        x = x0 + (block_w - tw) / 2
-        draw.text((x, y), word, font=font, fill=fill)
-        y += th + gap
 
     return img
 
@@ -842,10 +901,20 @@ def overlay_cache_key(image_sha: str, words: Sequence[str]) -> str:
 # ============================================================
 # UI
 # ============================================================
+st.markdown("---")
 st.title("🌤️ そらもよう～空をことばで感じるAIシステムの開発～")
+# ============================================================
+# 研究の目的（Webページ上部に表示）
+# ============================================================
+st.markdown(
+"""
+「そらもよう」は日本語特有の擬態語・情緒表現を通して、気象にもっと気軽に興味を持ってもらうために生まれた、
+空の写真から直感的な日本語表現を生成するAIシステムです。
+"""
+)
 
 # session_state init
-st.session_state.setdefault("gemini_cache", {})  # sha256(image_bytes) -> {"words": [...], "raw": "..."}
+st.session_state.setdefault("gemini_cache", {})  # sha256(image_bytes) -> {"words":[...], "defs":{word:def}, "raw":"..."}
 st.session_state.setdefault("overlay_cache", {})  # overlay_cache_key -> PIL.Image.Image
 
 with st.spinner("GitHub images/ を読み込み中..."):
@@ -924,7 +993,7 @@ else:
 st.write(f"インデックス登録数: {len(idx_names)} 枚")
 
 uploaded_file = st.file_uploader(
-    "空の写真をアップロード（JPEG/PNG/HEIC対応）",
+    "アップロードファイル（空の写真：JPEG/PNG/HEIC）",
     type=["jpg", "jpeg", "png", "heic", "HEIC"],
 )
 
@@ -956,6 +1025,7 @@ with st.spinner("類似画像を検索中..."):
 name_to_comment = {n: c for n, c in zip(idx_names, idx_comments)}
 
 st.subheader("🌈 類似している空（上位3枚）")
+st.caption("アップロード画像の特徴量と、GitHubに蓄積された特徴量を比較して、見た目が近い空の写真を表示します。")
 for name, score in results:
     url = image_download_url_by_name(name, image_items)
     if not url:
@@ -978,6 +1048,7 @@ best_score = float(np.max(sims)) if len(sims) else 0.0
 # ④ GitHub保存（既存ロジックを基本維持）
 st.markdown("---")
 st.subheader("📌 この画像を共有（GitHubへ保存）")
+st.caption("ここで保存すると、画像と特徴量がGitHubに追加され、次回以降の類似検索で使われます。重複画像は自動で弾きます。")
 
 # --- コメント（画像と紐づけて保存）---
 comment_name = st.text_input("本名またはニックネーム（任意）", key="comment_name")
@@ -1053,18 +1124,22 @@ if save_ok:
 # ============================================================
 st.markdown("---")
 st.subheader("🪄 単語の用意（Gemini または手入力）")
+st.caption("Geminiで自動生成するか、手入力で単語を用意します。生成結果は画像のSHAごとにキャッシュされ、同じ画像では繰り返し呼び出しません。")
 
 cache = st.session_state["gemini_cache"]
 cached_words = cache.get(q_sha, {}).get("words", [])
+cached_defs = cache.get(q_sha, {}).get("defs", {})
 cached_raw = cache.get(q_sha, {}).get("raw", "")
 
 colA, colB = st.columns([1, 1])
 with colA:
+    st.warning("Geminiボタンは連打しないでください。混雑（503）やクォータ上限（429）で失敗しやすくなります。")
     if st.button("Geminiで単語生成（ボタン押下時のみ）"):
-        with st.spinner("Geminiで単語生成中..."):
-            words, raw = gemini_generate_words(image_bytes)
+        with st.spinner("Geminiで出力生成中..."):
+            words, defs, raw = gemini_generate_words(image_bytes)
         if words:
-            cache[q_sha] = {"words": words, "raw": raw}
+            cache[q_sha] = {"words": words, "defs": defs, "raw": raw}
+            # 手入力欄には「単語だけ」を入れる（解説文は混ぜない）
             st.session_state["manual_words_text"] = "、".join(words)
             st.success(f"単語を {len(words)} 個生成しました。")
             st.rerun()
@@ -1093,6 +1168,15 @@ else:
 max_words = st.slider("最大単語数", min_value=1, max_value=12, value=8)
 raw_words = raw_words[:max_words]
 
+if cached_defs:
+    with st.expander("Geminiによる空の解説", expanded=False):
+        for w in cached_words:
+            d = str(cached_defs.get(w, "")).strip()
+            if d:
+                st.write(f"- **{w}**：{d}")
+            else:
+                st.write(f"- **{w}**")
+
 if cached_raw:
     with st.expander("Geminiの生出力（キャッシュ）", expanded=False):
         st.code(cached_raw)
@@ -1110,14 +1194,16 @@ else:
 # ⑧ 描画（ボタン押下）
 st.markdown("---")
 st.subheader("🖼️ 文字入り画像（プレビュー）")
+st.caption("用意した単語を、画像の上に自動配置して描画します。")
 
-font_path = st.text_input("フォントパス", value="fonts/NotoSansJP-Bold.ttf")
-padding_ratio = st.slider("余白（画像幅に対する比率）", min_value=0.01, max_value=0.15, value=0.05, step=0.01)
-min_font = st.slider("最小フォントサイズ", min_value=10, max_value=48, value=16, step=1)
-max_font = st.slider("最大フォントサイズ", min_value=24, max_value=140, value=92, step=2)
-size_gamma = st.slider("文字サイズ差の強さ（大きいほど差が出ます）", min_value=0.6, max_value=4.0, value=2.2, step=0.1)
-size_contrast = st.slider("文字サイズ差のコントラスト（僅差でも差を強調）", min_value=0.5, max_value=6.0, value=2.5, step=0.1)
-scatter_strength = st.slider("文字の散らし具合（0=縦積み, 1=最大）", min_value=0.0, max_value=1.0, value=0.55, step=0.05)
+# 描画パラメータ（UIからは変更しない）
+FONT_PATH = "fonts/NotoSansJP-Bold.ttf"
+PADDING_RATIO = 0.05
+MIN_FONT = 0
+MAX_FONT = 0
+SIZE_GAMMA = 2.2
+SIZE_CONTRAST = 5.0
+SCATTER_STRENGTH = 0.55
 
 draw_ok = bool(word_scores)
 
@@ -1125,19 +1211,19 @@ if st.button("文字を画像に描画する", disabled=not draw_ok):
     try:
         with st.spinner("描画中..."):
             key = overlay_cache_key(q_sha, [w for w, _ in word_scores[:max_words]])
-            key = f"{key}:min{min_font}:max{max_font}:g{size_gamma:.2f}:ct{size_contrast:.2f}:sc{scatter_strength:.2f}"
+            key = f"{key}:min{MIN_FONT}:max{MAX_FONT}:g{SIZE_GAMMA:.2f}:ct{SIZE_CONTRAST:.2f}:sc{SCATTER_STRENGTH:.2f}"
             overlay_cache = st.session_state["overlay_cache"]
             if key not in overlay_cache:
                 overlay_cache[key] = overlay_words_variable_size(
                     image_bytes=image_bytes,
                     word_scores=word_scores[:max_words],
-                    font_path=font_path,
-                    padding_ratio=padding_ratio,
-                    min_font=min_font,
-                    max_font=max_font,
-                    size_gamma=size_gamma,
-                    size_contrast=size_contrast,
-                    scatter_strength=scatter_strength,
+                    font_path=FONT_PATH,
+                    padding_ratio=PADDING_RATIO,
+                    min_font=MIN_FONT,
+                    max_font=MAX_FONT,
+                    size_gamma=SIZE_GAMMA,
+                    size_contrast=SIZE_CONTRAST,
+                    scatter_strength=SCATTER_STRENGTH,
                     seed=int(hashlib.sha256(key.encode('utf-8')).hexdigest()[:8], 16),
                 )
             st.session_state["overlay_last_key"] = key
